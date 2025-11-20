@@ -172,24 +172,24 @@ async def auto_sender(context: ContextTypes.DEFAULT_TYPE):
 
 WELCOME_TEXT = (
     "👋 Welcome!\n"
-    "I’m your simple multi-user auto-message bot.\n\n"
-    "Everything you add (channels, messages, settings) is *only for you*.\n\n"
+    "I’m your simple auto-message bot.\n\n"
     "Commands:\n"
-    "/start - Show this help\n"
-    "/addchannel - Add a channel (forward any message from it)\n"
-    "/listchannel - List your added channels\n"
-    "/removechannel - Remove one of *your* channels (interactive)\n"
+    "/start - Start the bot\n"
+    "/addchannel - Add your channel\n"
+    "/listchannel - List added channels\n"
+    "/removechannel - Remove a channel \n\n"
     "/addmessage - Add a message/template to send\n"
-    "/listmessage - List your saved messages\n"
-    "/removemessage - Remove one of your messages (interactive)\n"
-    "/clearmessage - Remove all your messages\n"
-    "/setbatch - Set messages per round (for you)\n"
-    "/setinterval - Set minutes between rounds (for you)\n"
-    "/startbot - Start auto messaging (for you)\n"
-    "/stopbot - Stop auto messaging (for you)\n"
-    "/status - Show your current status\n"
-    "/mydata - Show your raw stored data"
+    "/listmessage - List saved messages\n"
+    "/removemessage - Remove a message \n"
+    "/clearmessage - Remove all messages\n\n"
+    "/setbatch - Set messages per round\n"
+    "/setinterval - Set minutes between rounds\n\n"
+    "/startbot - Start auto messaging\n"
+    "/stopbot - Stop auto messaging\n\n"
+    "/status - Show current status\n"
+    "/mydata - Show raw stored data"
 )
+
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
