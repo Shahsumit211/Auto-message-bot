@@ -350,7 +350,15 @@ async def startbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     minutes = settings.get("interval_minutes", 5)
-    job_queue = context.application.job_queue
+
+    # ✅ use context.job_queue instead of context.application.job_queue
+    job_queue = context.job_queue
+    if job_queue is None:
+        await update.message.reply_text(
+            "⚠️ Background job queue is not available in this deployment.\n"
+            "Cannot start auto messaging."
+        )
+        return
 
     job_queue.run_repeating(
         auto_sender,
@@ -368,12 +376,20 @@ async def startbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
 async def stopbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     settings = user_data["settings"]
 
-    job_queue = context.application.job_queue
+    job_queue = context.job_queue
+    if job_queue is None:
+        await update.message.reply_text(
+            "⚠️ Background job queue is not available in this deployment.\n"
+            "Nothing to stop."
+        )
+        return
+
     jobs = job_queue.get_jobs_by_name(f"auto_sender_{user_id}")
     for j in jobs:
         j.schedule_removal()
@@ -381,6 +397,7 @@ async def stopbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings["running"] = False
     save_data()
     await update.message.reply_text("⏹ Your auto messaging stopped.")
+
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -550,21 +567,26 @@ def main():
 
     # Re-start jobs for all users whose bots were running
     users = DATA.get("users", {})
-    for user_id_str, user_data in users.items():
-        settings = user_data.get("settings", {})
-        if settings.get("running"):
-            try:
-                user_id = int(user_id_str)
-            except ValueError:
-                continue
-            minutes = settings.get("interval_minutes", 5)
-            application.job_queue.run_repeating(
-                auto_sender,
-                interval=timedelta(minutes=minutes),
-                first=0,
-                name=f"auto_sender_{user_id}",
-                data=user_id,
-            )
+    jq = application.job_queue
+    if jq is not None:
+        for user_id_str, user_data in users.items():
+            settings = user_data.get("settings", {})
+            if settings.get("running"):
+                try:
+                    user_id = int(user_id_str)
+                except ValueError:
+                    continue
+                minutes = settings.get("interval_minutes", 5)
+                jq.run_repeating(
+                    auto_sender,
+                    interval=timedelta(minutes=minutes),
+                    first=0,
+                    name=f"auto_sender_{user_id}",
+                    data=user_id,
+                )
+    else:
+        logging.warning("Job queue is None; auto-resume of jobs is disabled.")
+
 
     # Command handlers
     application.add_handler(CommandHandler("start", start))
