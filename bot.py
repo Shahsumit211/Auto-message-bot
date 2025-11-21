@@ -9,8 +9,10 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    JobQueue,
     filters,
 )
+
 
 DATA_FILE = "bot_data.json"
 
@@ -563,7 +565,12 @@ def main():
 
     print("✅ Bot starting with multi-user interactive version...")
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .job_queue(JobQueue())
+        .build()
+    )
 
     # Re-start jobs for all users whose bots were running
     users = DATA.get("users", {})
