@@ -3,6 +3,9 @@ import json
 import os
 from datetime import timedelta
 
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,36 +16,47 @@ from telegram.ext import (
     filters,
 )
 
+# ========= POSTGRES STORAGE =========
 
-DATA_FILE = "bot_data.json"
-
-# ========= STORAGE =========
-
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {"users": {}}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    # Simple migration: if no "users" key, start fresh
-    if "users" not in data:
-        data = {"users": {}}
-    return data
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
-def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(DATA, f, ensure_ascii=False, indent=2)
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
-DATA = load_data()
+def init_db():
+    """Create user_data table if it doesn't exist."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_data (
+            user_id BIGINT PRIMARY KEY,
+            data JSONB NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def get_user_data(user_id: int):
-    """Get or create the block for this user."""
-    users = DATA.setdefault("users", {})
-    key = str(user_id)
-    if key not in users:
-        users[key] = {
+def load_user_data(user_id: int) -> dict:
+    """Load one user's data from DB, or return default structure."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT data FROM user_data WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if row and row.get("data"):
+        data = row["data"]
+    else:
+        data = {
             "channels": [],
             "messages": [],
             "settings": {
@@ -52,40 +66,84 @@ def get_user_data(user_id: int):
                 "running": False,
             },
         }
-    return users[key]
+    return data
 
 
-def get_user_settings(user_id: int):
-    ud = get_user_data(user_id)
-    return ud.setdefault("settings", {
-        "batch_size": 1,
-        "interval_minutes": 5,
-        "next_message_index": 0,
-        "running": False,
-    })
+def save_user_data(user_id: int, data: dict):
+    """Upsert one user's data."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO user_data (user_id, data)
+        VALUES (%s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data
+        """,
+        (user_id, Json(data)),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_all_users():
+    """Get all (user_id, data) rows for auto-resume."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, data FROM user_data")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+# ========= PER-USER HELPERS =========
+
+def get_user_data(user_id: int) -> dict:
+    return load_user_data(user_id)
+
+
+def get_user_settings(user_id: int) -> dict:
+    data = get_user_data(user_id)
+    settings = data.setdefault(
+        "settings",
+        {
+            "batch_size": 1,
+            "interval_minutes": 5,
+            "next_message_index": 0,
+            "running": False,
+        },
+    )
+    # guarantee persistence even if settings was missing
+    save_user_data(user_id, data)
+    return settings
 
 
 # ========= HELPERS =========
 
 def add_channel_entry(user_id: int, chat):
-    user_data = get_user_data(user_id)
-    channels = user_data["channels"]
+    data = get_user_data(user_id)
+    channels = data.setdefault("channels", [])
+
     # Avoid duplicates by id
     for ch in channels:
         if ch["id"] == chat.id:
             return False
-    channels.append({
-        "id": chat.id,
-        "title": chat.title or getattr(chat, "full_name", chat.title),
-        "username": getattr(chat, "username", None),
-    })
-    save_data()
+
+    channels.append(
+        {
+            "id": chat.id,
+            "title": chat.title or getattr(chat, "full_name", chat.title),
+            "username": getattr(chat, "username", None),
+        }
+    )
+    save_user_data(user_id, data)
     return True
 
 
 def channels_text(user_id: int) -> str:
-    user_data = get_user_data(user_id)
-    channels = user_data["channels"]
+    data = get_user_data(user_id)
+    channels = data.get("channels", [])
     if not channels:
         return "No channels added yet."
     lines = []
@@ -96,19 +154,19 @@ def channels_text(user_id: int) -> str:
 
 
 def messages_text(user_id: int) -> str:
-    user_data = get_user_data(user_id)
-    messages = user_data["messages"]
+    data = get_user_data(user_id)
+    messages = data.get("messages", [])
     if not messages:
         return "No messages saved yet."
     lines = []
     for idx, m in enumerate(messages, start=1):
-        lines.append(f"{idx}. [{m['type']}] {m.get('preview','')}")
+        lines.append(f"{idx}. [{m['type']}] {m.get('preview', '')}")
     return "\n".join(lines)
 
 
 def add_message_entry(user_id: int, message):
-    user_data = get_user_data(user_id)
-    msgs = user_data["messages"]
+    data = get_user_data(user_id)
+    msgs = data.setdefault("messages", [])
 
     msg_type = "text"
     if message.photo:
@@ -127,25 +185,35 @@ def add_message_entry(user_id: int, message):
     text = message.text or message.caption or ""
     preview = (text[:40] + "…") if len(text) > 40 else text
 
-    msgs.append({
-        "from_chat_id": message.chat_id,
-        "message_id": message.message_id,
-        "type": msg_type,
-        "preview": preview,
-    })
-    save_data()
+    msgs.append(
+        {
+            "from_chat_id": message.chat_id,
+            "message_id": message.message_id,
+            "type": msg_type,
+            "preview": preview,
+        }
+    )
+    save_user_data(user_id, data)
 
 
 async def auto_sender(context: ContextTypes.DEFAULT_TYPE):
     """Job that sends messages for ONE user (user_id stored in job.data)."""
     user_id = context.job.data
-    user_data = get_user_data(user_id)
-    channels = user_data["channels"]
-    messages = user_data["messages"]
-    settings = user_data["settings"]
+    data = get_user_data(user_id)
+    channels = data.get("channels", [])
+    messages = data.get("messages", [])
+    settings = data.setdefault(
+        "settings",
+        {
+            "batch_size": 1,
+            "interval_minutes": 5,
+            "next_message_index": 0,
+            "running": False,
+        },
+    )
 
     if not channels or not messages:
-        # Nothing to do for this user
+        save_user_data(user_id, data)
         return
 
     batch_size = settings.get("batch_size", 1)
@@ -162,12 +230,14 @@ async def auto_sender(context: ContextTypes.DEFAULT_TYPE):
                     message_id=msg["message_id"],
                 )
             except Exception as e:
-                logging.warning("Failed to send to %s for user %s: %s", ch["id"], user_id, e)
+                logging.warning(
+                    "Failed to send to %s for user %s: %s", ch["id"], user_id, e
+                )
 
         idx = (idx + 1) % total
 
     settings["next_message_index"] = idx
-    save_data()
+    save_user_data(user_id, data)
 
 
 # ========= HANDLERS =========
@@ -239,9 +309,9 @@ async def listchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
+    data = get_user_data(user_id)
 
-    if not user_data["channels"]:
+    if not data.get("channels"):
         await update.message.reply_text("You have no channels to remove.")
         return
 
@@ -283,9 +353,9 @@ async def listmessage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def removemessage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
+    data = get_user_data(user_id)
 
-    if not user_data["messages"]:
+    if not data.get("messages"):
         await update.message.reply_text("You have no messages to remove.")
         return
 
@@ -300,11 +370,11 @@ async def removemessage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clearmessage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    count = len(user_data["messages"])
-    user_data["messages"].clear()
-    user_data["settings"]["next_message_index"] = 0
-    save_data()
+    data = get_user_data(user_id)
+    count = len(data.get("messages", []))
+    data["messages"] = []
+    data.setdefault("settings", {})["next_message_index"] = 0
+    save_user_data(user_id, data)
     await update.message.reply_text(f"✅ Cleared {count} of *your* messages.")
 
 
@@ -336,24 +406,25 @@ async def setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def startbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    settings = user_data["settings"]
+    data = get_user_data(user_id)
+    settings = data.setdefault("settings", {})
+    channels = data.get("channels", [])
+    messages = data.get("messages", [])
 
     if settings.get("running"):
         await update.message.reply_text("Your auto messaging is already running.")
         return
 
-    if not user_data["channels"]:
+    if not channels:
         await update.message.reply_text("Add at least one channel first with /addchannel.")
         return
 
-    if not user_data["messages"]:
+    if not messages:
         await update.message.reply_text("Add at least one message first with /addmessage.")
         return
 
     minutes = settings.get("interval_minutes", 5)
 
-    # ✅ use context.job_queue instead of context.application.job_queue
     job_queue = context.job_queue
     if job_queue is None:
         await update.message.reply_text(
@@ -371,18 +442,17 @@ async def startbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     settings["running"] = True
-    save_data()
+    save_user_data(user_id, data)
     await update.message.reply_text(
         f"✅ Your auto messaging started.\n"
-        f"Interval: {minutes} minute(s), batch: {settings.get('batch_size',1)} message(s) per round."
+        f"Interval: {minutes} minute(s), batch: {settings.get('batch_size', 1)} message(s) per round."
     )
-
 
 
 async def stopbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    settings = user_data["settings"]
+    data = get_user_data(user_id)
+    settings = data.setdefault("settings", {})
 
     job_queue = context.job_queue
     if job_queue is None:
@@ -397,20 +467,19 @@ async def stopbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         j.schedule_removal()
 
     settings["running"] = False
-    save_data()
+    save_user_data(user_id, data)
     await update.message.reply_text("⏹ Your auto messaging stopped.")
-
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    settings = user_data["settings"]
+    data = get_user_data(user_id)
+    settings = data.setdefault("settings", {})
     running = "✅ RUNNING" if settings.get("running") else "⏹ STOPPED"
     text = (
         f"Your status: {running}\n\n"
-        f"Your channels: {len(user_data['channels'])}\n"
-        f"Your messages: {len(user_data['messages'])}\n"
+        f"Your channels: {len(data.get('channels', []))}\n"
+        f"Your messages: {len(data.get('messages', []))}\n"
         f"Your batch size: {settings.get('batch_size', 1)}\n"
         f"Your interval: {settings.get('interval_minutes', 5)} minute(s)\n"
         f"Next message index: {settings.get('next_message_index', 0) + 1}"
@@ -420,8 +489,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def mydata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    raw = json.dumps(user_data, ensure_ascii=False, indent=2)
+    data = get_user_data(user_id)
+    raw = json.dumps(data, ensure_ascii=False, indent=2)
     if len(raw) < 3800:
         await update.message.reply_text(f"```json\n{raw}\n```", parse_mode="Markdown")
     else:
@@ -448,8 +517,8 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     msg = update.message
     text = (msg.text or "").strip()
     user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    settings = user_data["settings"]
+    data = get_user_data(user_id)
+    settings = data.setdefault("settings", {})
 
     # 1) Remove channel index
     if context.user_data.get("awaiting_remove_channel_index"):
@@ -462,12 +531,12 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             await msg.reply_text("❌ Channel removal cancelled.")
             return
         idx -= 1
-        channels = user_data["channels"]
+        channels = data.get("channels", [])
         if not (0 <= idx < len(channels)):
             await msg.reply_text("Invalid index. Send a correct number or 0 to cancel.")
             return
         ch = channels.pop(idx)
-        save_data()
+        save_user_data(user_id, data)
         context.user_data["awaiting_remove_channel_index"] = False
         await msg.reply_text(
             f"✅ Removed your channel: {ch['title']} (id={ch['id']})"
@@ -485,15 +554,15 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             await msg.reply_text("❌ Message removal cancelled.")
             return
         idx -= 1
-        messages = user_data["messages"]
+        messages = data.get("messages", [])
         if not (0 <= idx < len(messages)):
             await msg.reply_text("Invalid index. Send a correct number or 0 to cancel.")
             return
         m = messages.pop(idx)
-        save_data()
+        save_user_data(user_id, data)
         context.user_data["awaiting_remove_message_index"] = False
         await msg.reply_text(
-            f"✅ Removed your message #{idx+1}: [{m['type']}] {m.get('preview','')}"
+            f"✅ Removed your message #{idx+1}: [{m['type']}] {m.get('preview', '')}"
         )
         return
 
@@ -508,10 +577,12 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             await msg.reply_text("❌ Batch size change cancelled.")
             return
         if val <= 0:
-            await msg.reply_text("Batch size must be greater than 0. Try again or send 0 to cancel.")
+            await msg.reply_text(
+                "Batch size must be greater than 0. Try again or send 0 to cancel."
+            )
             return
         settings["batch_size"] = val
-        save_data()
+        save_user_data(user_id, data)
         context.user_data["awaiting_batch_size"] = False
         await msg.reply_text(f"✅ Your batch size is now {val} messages per round.")
         return
@@ -528,10 +599,12 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             await msg.reply_text("❌ Interval change cancelled.")
             return
         if val <= 0:
-            await msg.reply_text("Interval must be greater than 0. Try again or send 0 to cancel.")
+            await msg.reply_text(
+                "Interval must be greater than 0. Try again or send 0 to cancel."
+            )
             return
         settings["interval_minutes"] = val
-        save_data()
+        save_user_data(user_id, data)
         context.user_data["awaiting_interval_minutes"] = False
         await msg.reply_text(
             f"✅ Your interval is now {val} minute(s) between rounds.\n"
@@ -563,7 +636,10 @@ def main():
         print("Error: BOT_TOKEN environment variable is not set.")
         return
 
-    print("✅ Bot starting with multi-user interactive version...")
+    # Init DB table
+    init_db()
+
+    print("✅ Bot starting with multi-user interactive version (Postgres)...")
 
     application = (
         ApplicationBuilder()
@@ -572,28 +648,22 @@ def main():
         .build()
     )
 
-    # Re-start jobs for all users whose bots were running
-    users = DATA.get("users", {})
+    # Auto-resume jobs for users whose bots were running
     jq = application.job_queue
-    if jq is not None:
-        for user_id_str, user_data in users.items():
-            settings = user_data.get("settings", {})
-            if settings.get("running"):
-                try:
-                    user_id = int(user_id_str)
-                except ValueError:
-                    continue
-                minutes = settings.get("interval_minutes", 5)
-                jq.run_repeating(
-                    auto_sender,
-                    interval=timedelta(minutes=minutes),
-                    first=0,
-                    name=f"auto_sender_{user_id}",
-                    data=user_id,
-                )
-    else:
-        logging.warning("Job queue is None; auto-resume of jobs is disabled.")
-
+    users = get_all_users()
+    for row in users:
+        user_id = row["user_id"]
+        data = row.get("data") or {}
+        settings = data.get("settings", {})
+        if settings.get("running"):
+            minutes = settings.get("interval_minutes", 5)
+            jq.run_repeating(
+                auto_sender,
+                interval=timedelta(minutes=minutes),
+                first=0,
+                name=f"auto_sender_{user_id}",
+                data=user_id,
+            )
 
     # Command handlers
     application.add_handler(CommandHandler("start", start))
@@ -618,7 +688,9 @@ def main():
 
     # Forwarded messages from channels for /addchannel
     application.add_handler(
-        MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, capture_forwarded_channel)
+        MessageHandler(
+            filters.FORWARDED & filters.ChatType.PRIVATE, capture_forwarded_channel
+        )
     )
 
     # ALL other private messages for interactive input & addmessage
