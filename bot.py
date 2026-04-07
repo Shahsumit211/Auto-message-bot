@@ -1,7 +1,9 @@
+
 import logging
 import json
 import os
 from datetime import timedelta
+import threading
 
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
@@ -622,6 +624,20 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     # await msg.reply_text("Use /start to see available commands.")
     return
 
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"Web server running on port {port}")
+    server.serve_forever()
+
 
 # ---------- MAIN ----------
 
@@ -698,6 +714,7 @@ def main():
         MessageHandler(filters.ALL & filters.ChatType.PRIVATE, handle_private_message)
     )
 
+    threading.Thread(target=run_server).start()
     application.run_polling()
 
 
